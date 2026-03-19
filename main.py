@@ -1,51 +1,87 @@
-import os
-import sys
-import time
 import ctypes
 import json
-import re
-import threading
-import subprocess
-from pathlib import Path
-from ctypes import c_char_p, c_uint32, c_int32, c_void_p
-
-import psutil
-import socket
+import os
 import platform
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+from ctypes import c_char_p, c_int32, c_uint32, c_void_p
+from pathlib import Path
 
 import objc
+import psutil
+import Quartz
 from Cocoa import (
-    NSApplication,
-    NSApp,
-    NSWindow,
-    NSButton,
-    NSTableView,
-    NSScrollView,
-    NSTableColumn,
-    NSObject,
-    NSMakeRect,
-    NSRunningApplication,
-    NSApplicationActivationPolicyRegular,
-    NSApplicationActivateIgnoringOtherApps,
+    NSURL,
     NSAlert,
     NSAlertStyleInformational,
-    NSWorkspace,
-    NSURL,
+    NSApp,
+    NSApplication,
+    NSApplicationActivateIgnoringOtherApps,
+    NSApplicationActivationPolicyRegular,
+    NSButton,
+    NSEventModifierFlagCommand,
+    NSImage,
+    NSImageView,
+    NSMakeRect,
+    NSMenu,
+    NSMenuItem,
+    NSObject,
+    NSPasteboard,
+    NSPopUpButton,
+    NSRunningApplication,
+    NSScrollView,
+    NSSearchField,
+    NSStringPboardType,
+    NSTableColumn,
+    NSTableView,
     NSTextField,
     NSTimer,
-    NSSearchField,
-    NSPopUpButton,
-    NSPasteboard,
-    NSStringPboardType,
-    NSImageView,
-    NSImage,
+    NSWindow,
+    NSWorkspace,
 )
-
-import Quartz
 
 # Active NDI par défaut sur les machines compatibles.
 # Sur une machine qui segfault avec libndi.dylib, tu peux repasser localement à False.
 ENABLE_NDI = True
+
+
+def _get_macos_major_version() -> int:
+    mac_ver, _, _ = platform.mac_ver()
+    if not mac_ver:
+        return 0
+    try:
+        return int(mac_ver.split(".")[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _validate_supported_platform_or_exit() -> None:
+    system_name = platform.system().lower()
+    machine = platform.machine().lower()
+    major = _get_macos_major_version()
+
+    # Cette application cible uniquement macOS 13+ sur Apple Silicon.
+    if system_name != "darwin":
+        sys.stderr.write(
+            "NDI Manager supporte uniquement macOS 13+ sur Apple Silicon (puce M).\n"
+        )
+        raise SystemExit(1)
+
+    if machine != "arm64":
+        sys.stderr.write(
+            "Architecture non supportee. Utilise un Mac Apple Silicon (arm64 / puce M).\n"
+        )
+        raise SystemExit(1)
+
+    if major < 13:
+        sys.stderr.write(
+            "Version non supportee. NDI Manager requiert macOS 13 (Ventura) ou plus recent.\n"
+        )
+        raise SystemExit(1)
 
 
 class NDIlib_source_t(ctypes.Structure):
@@ -99,10 +135,7 @@ class NDIWrapper:
         # Heuristique simple : on ne tente pas NDI sur macOS < 13 pour éviter
         # les plantages connus de certaines versions de libndi.dylib.
         mac_ver, _, _ = platform.mac_ver()
-        try:
-            major = int(mac_ver.split(".")[0]) if mac_ver else 0
-        except ValueError:
-            major = 0
+        major = _get_macos_major_version()
         if major and major < 13:
             raise RuntimeError(
                 f"NDI non supporté sur macOS {mac_ver} (mode compatibilité activé, nécessite macOS 13+)."
@@ -483,6 +516,9 @@ class PreviewController(NSObject):
 
 class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, notification):
+        self._alert_last_shown = {}
+        self._did_warn_ndi_unavailable = False
+
         screen_frame = NSApp().mainWindow().screen().frame() if NSApp().mainWindow() else None
         # Fenêtre plus large pour que tous les contrôles tiennent correctement
         width, height = 960, 480
@@ -606,7 +642,7 @@ class AppDelegate(NSObject):
         self.refresh_button = NSButton.alloc().initWithFrame_(NSMakeRect(20, 15, 130, 26))
         self.refresh_button.setTitle_("Refresh NDI")
         self.refresh_button.setTarget_(self)
-        self.refresh_button.setAction_("refreshNDI:")
+        self.refresh_button.setAction_("manualRefreshNDI:")
 
         self.preview_button = NSButton.alloc().initWithFrame_(NSMakeRect(160, 15, 90, 26))
         self.preview_button.setTitle_("Preview")
@@ -671,12 +707,25 @@ class AppDelegate(NSObject):
         )
 
     def refreshNDI_(self, sender):
+        self._refresh_ndi(show_popup_on_error=False)
+
+    def manualRefreshNDI_(self, sender):
+        self._refresh_ndi(show_popup_on_error=True)
+
+    def _refresh_ndi(self, show_popup_on_error: bool):
         if not self.ndi:
-            self._show_alert("NDI", "NDI n'est pas initialisé (mode compatibilité, voir message de démarrage).")
+            self.status_label.setStringValue_("NDI non initialisé (mode compatibilité).")
+            if show_popup_on_error and not self._did_warn_ndi_unavailable:
+                self._show_alert(
+                    "NDI",
+                    "NDI n'est pas initialisé (mode compatibilité, voir message de démarrage).",
+                )
+                self._did_warn_ndi_unavailable = True
             return
         try:
             self.status_label.setStringValue_("Recherche des sources NDI…")
             sources = self.ndi.list_sources()
+            self._did_warn_ndi_unavailable = False
             names = set(s.get("name", "") for s in sources if s.get("name"))
             appeared = sorted(names - self.last_source_names)
             disappeared = sorted(self.last_source_names - names)
@@ -698,7 +747,8 @@ class AppDelegate(NSObject):
                     f"{len(sources)} source(s) NDI ({', '.join(delta)}). Dernier scan: {time.strftime('%H:%M:%S')}"
                 )
         except Exception as e:
-            self._show_alert("Erreur NDI", str(e))
+            if show_popup_on_error:
+                self._show_alert_throttled("ndi-refresh", "Erreur NDI", str(e), cooldown_s=20.0)
             self.status_label.setStringValue_("Erreur pendant le scan NDI.")
 
     def checkNetwork_(self, sender):
@@ -798,9 +848,9 @@ class AppDelegate(NSObject):
                 )
                 out = p.stdout.strip() or p.stderr.strip() or "(pas de sortie)"
                 title = f"Ping {ip} — {'OK' if p.returncode == 0 else 'KO'}"
-                self._show_alert(title, out[:4000])
+                self._show_alert_on_main_thread(title, out[:4000])
             finally:
-                self.status_label.setStringValue_("Ping terminé.")
+                self._set_status_on_main_thread("Ping terminé.")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -919,9 +969,63 @@ class AppDelegate(NSObject):
         alert.setAlertStyle_(NSAlertStyleInformational)
         alert.runModal()
 
+    def _show_alert_throttled(self, key: str, title: str, message: str, cooldown_s: float = 10.0):
+        now = time.time()
+        last = self._alert_last_shown.get(key, 0.0)
+        if (now - last) < cooldown_s:
+            return
+        self._alert_last_shown[key] = now
+        self._show_alert(title, message)
+
+    def _show_alert_on_main_thread(self, title: str, message: str):
+        # Evite d'afficher un NSAlert depuis un thread secondaire.
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "showAlertFromPayload:",
+            {"title": title, "message": message},
+            False,
+        )
+
+    def showAlertFromPayload_(self, payload):
+        title = payload.get("title", "Information")
+        message = payload.get("message", "")
+        self._show_alert(title, message)
+
+    def _set_status_on_main_thread(self, text: str):
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "setStatusFromPayload:",
+            {"text": text},
+            False,
+        )
+
+    def setStatusFromPayload_(self, payload):
+        self.status_label.setStringValue_(payload.get("text", ""))
+
+    def applicationShouldTerminateAfterLastWindowClosed_(self, sender):
+        return True
+
+
+def _install_macos_app_menu(app):
+    main_menu = NSMenu.alloc().initWithTitle_("MainMenu")
+
+    app_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+    main_menu.addItem_(app_menu_item)
+
+    app_menu = NSMenu.alloc().initWithTitle_("Application")
+    quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Quit NDI Manager",
+        "terminate:",
+        "q",
+    )
+    quit_item.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+    app_menu.addItem_(quit_item)
+    app_menu_item.setSubmenu_(app_menu)
+
+    app.setMainMenu_(main_menu)
+
 
 def main():
     app = NSApplication.sharedApplication()
+    _install_macos_app_menu(app)
     delegate = AppDelegate.alloc().init()
     app.setDelegate_(delegate)
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
@@ -934,6 +1038,7 @@ def main():
 
 if __name__ == "__main__":
     try:
+        _validate_supported_platform_or_exit()
         main()
     except KeyboardInterrupt:
         sys.exit(0)

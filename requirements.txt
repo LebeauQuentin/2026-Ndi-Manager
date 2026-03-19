@@ -1,3 +1,4 @@
 pyobjc
 psutil
 py2app
+ruff
