@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ctypes
 import json
 import os
@@ -85,9 +87,15 @@ def _validate_supported_platform_or_exit() -> None:
 
 
 class NDIlib_source_t(ctypes.Structure):
+    class _UrlOrIpUnion(ctypes.Union):
+        _fields_ = [
+            ("p_url_address", c_char_p),
+            ("p_ip_address", c_char_p),
+        ]
+
     _fields_ = [
         ("p_ndi_name", c_char_p),
-        ("p_url_address", c_char_p),
+        ("u", _UrlOrIpUnion),
     ]
 
 
@@ -147,6 +155,10 @@ class NDIWrapper:
             raise RuntimeError(f"Impossible de trouver libndi.dylib à {lib_path}")
 
         self.lib = ctypes.cdll.LoadLibrary(lib_path)
+        # Keep-alive des objets passés à NDI via ctypes.
+        # On garde bytes + structures (source/settings) pour éviter toute invalidation
+        # prématurée côté Python.
+        self._ndi_keepalive: dict[int, dict] = {}
 
         # Initialisation NDI
         if not self.lib.NDIlib_initialize():
@@ -156,15 +168,18 @@ class NDIWrapper:
         self.lib.NDIlib_find_create_v2.restype = c_void_p
         self.lib.NDIlib_find_create_v2.argtypes = [ctypes.POINTER(NDIlib_find_create_t)]
 
-        self.lib.NDIlib_find_get_current_sources.restype = c_int32
+        # NDI SDK: NDIlib_find_get_current_sources(finder, &no_sources)
+        # (2 args) retourne un pointeur vers NDIlib_source_t const*.
+        self.lib.NDIlib_find_get_current_sources.restype = ctypes.POINTER(NDIlib_source_t)
         self.lib.NDIlib_find_get_current_sources.argtypes = [
             c_void_p,
-            ctypes.POINTER(ctypes.POINTER(NDIlib_source_t)),
-            c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
         ]
 
         self.lib.NDIlib_find_destroy.restype = None
         self.lib.NDIlib_find_destroy.argtypes = [c_void_p]
+        self.lib.NDIlib_find_wait_for_sources.restype = ctypes.c_bool
+        self.lib.NDIlib_find_wait_for_sources.argtypes = [c_void_p, c_uint32]
 
         # Receiver
         self.lib.NDIlib_recv_create_v3.restype = c_void_p
@@ -172,6 +187,9 @@ class NDIWrapper:
 
         self.lib.NDIlib_recv_destroy.restype = None
         self.lib.NDIlib_recv_destroy.argtypes = [c_void_p]
+
+        self.lib.NDIlib_recv_connect.restype = None
+        self.lib.NDIlib_recv_connect.argtypes = [c_void_p, ctypes.POINTER(NDIlib_source_t)]
 
         self.lib.NDIlib_recv_capture_v2.restype = c_int32
         self.lib.NDIlib_recv_capture_v2.argtypes = [
@@ -199,26 +217,138 @@ class NDIWrapper:
             # On laisse 2 secondes pour découvrir les sources
             time.sleep(2.0)
 
-            sources_ptr = ctypes.POINTER(NDIlib_source_t)()
-            count = self.lib.NDIlib_find_get_current_sources(
-                finder, ctypes.byref(sources_ptr), 0
+            no_sources = ctypes.c_uint32(0)
+            sources_ptr = self.lib.NDIlib_find_get_current_sources(
+                finder, ctypes.byref(no_sources)
             )
+            count = int(no_sources.value or 0)
+            if not sources_ptr or count <= 0:
+                return []
+
             result = []
+            # Les chaînes retournées dans NDIlib_source_t restent valides
+            # jusqu'au prochain appel de NDIlib_find_get_current_sources ou destroy.
             for i in range(count):
                 src = sources_ptr[i]
                 name = src.p_ndi_name.decode("utf-8") if src.p_ndi_name else "Unnamed"
-                url = src.p_url_address.decode("utf-8") if src.p_url_address else ""
-                ip = _extract_ip_from_url(url) or ""
-                result.append({"name": name, "url": url, "ip": ip})
+                raw_url = src.u.p_url_address.decode("utf-8") if src.u.p_url_address else None
+                raw_ip = src.u.p_ip_address.decode("utf-8") if src.u.p_ip_address else None
+                # Conserver url et ip séparément:
+                # - 'url' affichée = p_url_address (si dispo)
+                # - 'ip' affichée = IP extraite depuis url, sinon ip_raw
+                # - 'ip_raw' (caché côté UI) = p_ip_address brut (utile pour create_receiver)
+                url = raw_url or ""
+                ip_from_url = _extract_ip_from_url(raw_url) if raw_url else None
+                ip_display = ip_from_url or (raw_ip or "") or ""
+                result.append({"name": name, "url": url, "ip": ip_display, "ip_raw": raw_ip or ""})
             return result
         finally:
             self.lib.NDIlib_find_destroy(finder)
 
     def create_receiver(self, source: dict, recv_name: str = "NDI Manager Preview"):
-        src = NDIlib_source_t(
-            p_ndi_name=source["name"].encode("utf-8"),
-            p_url_address=source["url"].encode("utf-8") if source.get("url") else None,
-        )
+        source_name = source.get("name", "")
+        recv_name_b = recv_name.encode("utf-8")
+
+        # Chemin préféré: retrouver la source exacte via le finder puis créer le receiver
+        # avec la struct NDIlib_source_t recopiée telle que fournie par le SDK.
+        finder = None
+        try:
+            finder_desc = NDIlib_find_create_t(
+                show_local_sources=True,
+                p_groups=None,
+                p_extra_ips=None,
+            )
+            finder = self.lib.NDIlib_find_create_v2(ctypes.byref(finder_desc))
+            if finder:
+                # Laisse au finder le temps de mettre à jour la table.
+                self.lib.NDIlib_find_wait_for_sources(finder, 1000)
+                no_sources = ctypes.c_uint32(0)
+                sources_ptr = self.lib.NDIlib_find_get_current_sources(
+                    finder, ctypes.byref(no_sources)
+                )
+                count = int(no_sources.value or 0)
+                if sources_ptr and count > 0 and source_name:
+                    for i in range(count):
+                        s = sources_ptr[i]
+                        n = s.p_ndi_name.decode("utf-8") if s.p_ndi_name else ""
+                        if n == source_name:
+                            # Copie "owned" des champs source pour ne pas dépendre
+                            # de la mémoire interne du finder.
+                            n_b = s.p_ndi_name if s.p_ndi_name else b""
+                            u_b = s.u.p_url_address if s.u.p_url_address else b""
+                            ip_b = s.u.p_ip_address if s.u.p_ip_address else b""
+
+                            src_owned = NDIlib_source_t()
+                            src_owned.p_ndi_name = n_b if n_b else None
+                            if u_b:
+                                src_owned.u.p_url_address = u_b
+                                src_owned.u.p_ip_address = None
+                            elif ip_b:
+                                src_owned.u.p_ip_address = ip_b
+                                src_owned.u.p_url_address = None
+
+                            settings = NDIlib_recv_create_v3_t(
+                                source_to_connect_to=src_owned,
+                                color_format=0,
+                                bandwidth=100,
+                                allow_video_fields=True,
+                                p_ndi_recv_name=recv_name_b,
+                            )
+                            inst = self.lib.NDIlib_recv_create_v3(ctypes.byref(settings))
+                            if inst:
+                                try:
+                                    self.lib.NDIlib_recv_connect(inst, ctypes.byref(src_owned))
+                                except Exception:
+                                    pass
+                                try:
+                                    inst_key = int(inst)
+                                    self._ndi_keepalive[inst_key] = {
+                                        "bytes": tuple(
+                                            b
+                                            for b in (recv_name_b, n_b, u_b, ip_b)
+                                            if b is not None and isinstance(b, (bytes, bytearray)) and len(b) > 0
+                                        ),
+                                        "source_struct": src_owned,
+                                        "settings_struct": settings,
+                                    }
+                                except Exception:
+                                    pass
+                                return inst
+                            break
+        except Exception:
+            # fallback: mode string-based ci-dessous
+            pass
+        finally:
+            if finder:
+                try:
+                    self.lib.NDIlib_find_destroy(finder)
+                except Exception:
+                    pass
+
+        ndi_name_b = source.get("name", "").encode("utf-8")
+        url_raw = source.get("url") or ""
+        ip_raw = source.get("ip_raw") or ""
+        ip_display = source.get("ip") or ""
+
+        url_b = url_raw.encode("utf-8") if url_raw else b""
+        ip_raw_b = ip_raw.encode("utf-8") if ip_raw else b""
+        ip_display_b = ip_display.encode("utf-8") if ip_display else b""
+
+        src = NDIlib_source_t()
+        src.p_ndi_name = ndi_name_b if ndi_name_b else None
+
+        # Preferer p_url_address si disponible (peu importe la présence ou non d'un scheme).
+        # Sinon utiliser p_ip_address brut si présent.
+        if url_raw:
+            src.u.p_url_address = url_b
+            src.u.p_ip_address = None
+        elif ip_raw:
+            src.u.p_ip_address = ip_raw_b
+            src.u.p_url_address = None
+        elif ip_display:
+            # fallback ultime (affiché) - mieux vaut moins de heuristique possible.
+            src.u.p_ip_address = ip_display_b
+            src.u.p_url_address = None
 
         # color_format = NDIlib_recv_color_format_BGRX_BGRA (0)
         # bandwidth = NDIlib_recv_bandwidth_highest (100)
@@ -227,11 +357,35 @@ class NDIWrapper:
             color_format=0,
             bandwidth=100,
             allow_video_fields=True,
-            p_ndi_recv_name=recv_name.encode("utf-8"),
+            p_ndi_recv_name=recv_name_b,
         )
         inst = self.lib.NDIlib_recv_create_v3(ctypes.byref(settings))
         if not inst:
             raise RuntimeError("Impossible de créer le receiver NDI")
+
+        # Force une connexion explicite au cas où la source initiale ne soit pas
+        # prise en compte immédiatement par l'implémentation.
+        try:
+            self.lib.NDIlib_recv_connect(inst, ctypes.byref(src))
+        except Exception:
+            pass
+
+        # Keep-alive jusqu'au destroy_receiver
+        try:
+            inst_key = int(inst)
+            keep = tuple(
+                b
+                for b in (ndi_name_b, url_b, ip_raw_b, ip_display_b, recv_name_b)
+                if b is not None and isinstance(b, (bytes, bytearray)) and len(b) > 0
+            )
+            self._ndi_keepalive[inst_key] = {
+                "bytes": keep,
+                "source_struct": src,
+                "settings_struct": settings,
+            }
+        except Exception:
+            pass
+
         return inst
 
     def capture_video_frame(self, recv_instance, timeout_ms: int = 1000):
@@ -249,6 +403,10 @@ class NDIWrapper:
 
     def destroy_receiver(self, recv_instance):
         if recv_instance:
+            try:
+                self._ndi_keepalive.pop(int(recv_instance), None)
+            except Exception:
+                pass
             self.lib.NDIlib_recv_destroy(recv_instance)
 
 
@@ -429,8 +587,17 @@ class TableDataSource(NSObject):
         return len(self.filtered)
 
     def tableView_objectValueForTableColumn_row_(self, tableView, column, row):
-        key = column.identifier()
-        return self.filtered[row].get(key, "")
+        try:
+            if row < 0 or row >= len(self.filtered):
+                return ""
+            key = column.identifier()
+            # Assure-toi que la clé est une chaîne Python (PyObjC peut renvoyer un objet ObjC).
+            key_s = str(key) if key is not None else ""
+            v = self.filtered[row].get(key_s, "")
+            return v if v is not None else ""
+        except Exception:
+            # Ne jamais lever d'exception dans un callback Cocoa: PyObjC peut sinon planter.
+            return ""
 
     def updateData_(self, new_data):
         self.data = new_data or []
@@ -779,40 +946,97 @@ class AppDelegate(NSObject):
             self._show_alert("Preview", "Sélectionne une source NDI d'abord.")
             return
 
-        try:
-            recv = self.ndi.create_receiver(row, recv_name="NDI Manager MiniPreview")
-        except Exception as e:
-            self._show_alert("Preview", f"Impossible de créer le receiver NDI.\n{e}")
-            return
+        # Variantes de connexion : NDI peut accepter une source via p_url_address ou p_ip_address.
+        # On essaye donc plusieurs modes pour isoler le champ attendu.
+        ip_only = _extract_ip_from_url(row.get("url", "") or "") or row.get("ip", "")
 
-        frame = None
-        try:
-            # On tente quelques captures rapides (jusqu'à 1,5s au total)
-            for _ in range(3):
-                frame, frame_type = self.ndi.capture_video_frame(recv, timeout_ms=500)
-                if frame is None:
-                    continue
-                img = _ndi_frame_to_nsimage(frame)
-                self.ndi.free_video_frame(recv, frame)
-                frame = None
-                if img is not None:
-                    self.preview_image.setImage_(img)
-                    self.status_label.setStringValue_(f"Mini-preview mis à jour pour: {row.get('name','')}")
-                    break
-            else:
-                self._show_alert("Preview", "Aucune image NDI n'a pu être capturée (timeout ou format non supporté).")
-        except Exception as e:
-            self._show_alert("Preview", f"Erreur lors de la capture NDI.\n{e}")
-        finally:
-            if frame is not None:
-                try:
-                    self.ndi.free_video_frame(recv, frame)
-                except Exception:
-                    pass
+        variants = [
+            ("mode:url->p_url_address", row),
+            (
+                "mode:ipOnly->p_ip_address",
+                {"name": row.get("name", ""), "url": "", "ip_raw": ip_only, "ip": row.get("ip", "")},
+            ),
+            (
+                "mode:nameOnly",
+                {"name": row.get("name", ""), "url": "", "ip_raw": "", "ip": ""},
+            ),
+        ]
+
+        overall_last_frame_type = None
+        mode_last_frame_types: list[tuple[str, int | None]] = []
+        mode_type_sequences: list[tuple[str, str]] = []
+        for mode_name, variant in variants:
+            recv = None
+            frame = None
             try:
-                self.ndi.destroy_receiver(recv)
+                recv = self.ndi.create_receiver(variant, recv_name="NDI Manager MiniPreview")
+                # Petit délai pour laisser le receiver s'établir
+                time.sleep(0.5)
+
+                # On tente plus longtemps pour les sources lentes à démarrer.
+                total_attempts = 25
+                timeout_ms = 1000
+
+                local_last_frame_type = None
+                local_types: list[int] = []
+                for _ in range(total_attempts):
+                    frame, frame_type = self.ndi.capture_video_frame(recv, timeout_ms=timeout_ms)
+                    overall_last_frame_type = frame_type
+                    local_last_frame_type = frame_type
+                    local_types.append(int(frame_type))
+                    if frame is None:
+                        continue
+                    img = _ndi_frame_to_nsimage(frame)
+                    self.ndi.free_video_frame(recv, frame)
+                    frame = None
+                    if img is not None:
+                        self.preview_image.setImage_(img)
+                        self.status_label.setStringValue_(f"Mini-preview mis à jour ({mode_name}) pour: {row.get('name','')}")
+                        return
+                # conversion échouée ou aucun frame
             except Exception:
+                # On laisse tomber ce mode, on essaie le suivant.
                 pass
+            finally:
+                if recv is not None:
+                    # Enregistre le résultat du mode même si on n'a pas de frame vidéo.
+                    # (S'il y a eu une exception, local_last_frame_type peut être non défini,
+                    # dans ce cas on laisse None.)
+                    try:
+                        mode_last_frame_types.append((mode_name, local_last_frame_type))
+                        seq = ",".join(str(t) for t in local_types[:12])
+                        if len(local_types) > 12:
+                            seq += ",..."
+                        mode_type_sequences.append((mode_name, seq))
+                    except Exception:
+                        mode_last_frame_types.append((mode_name, None))
+                        mode_type_sequences.append((mode_name, "n/a"))
+                if frame is not None and recv is not None:
+                    try:
+                        self.ndi.free_video_frame(recv, frame)
+                    except Exception:
+                        pass
+                if recv is not None:
+                    try:
+                        self.ndi.destroy_receiver(recv)
+                    except Exception:
+                        pass
+
+        # Si aucun mode ne donne une frame vidéo convertible :
+        target_url = row.get("url", "")
+        target_ip_raw = row.get("ip_raw", "")
+        target_ip_display = row.get("ip", "")
+        self._show_alert(
+            "Preview",
+            "Aucune image NDI n'a pu être capturée (timeout / flux non reçu).\n"
+            f"- last frame_type: {overall_last_frame_type}\n"
+            f"- per-mode: {', '.join([f'{m}:{t}' for (m,t) in mode_last_frame_types])}\n"
+            f"- per-mode sequence: {' | '.join([f'{m}=[{s}]' for (m,s) in mode_type_sequences])}\n"
+            f"- target name: {row.get('name','')}\n"
+            f"- target url (p_url_address): {target_url}\n"
+            f"- target ip_raw (p_ip_address): {target_ip_raw}\n"
+            f"- target ip (display): {target_ip_display}",
+        )
 
     def copyIP_(self, sender):
         row = self._selected_row()
