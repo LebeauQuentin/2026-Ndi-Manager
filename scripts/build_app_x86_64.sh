@@ -7,15 +7,15 @@ cd "$ROOT_DIR"
 export PYTHONPYCACHEPREFIX="$PWD/.pycache"
 export PYTHONDONTWRITEBYTECODE=1
 
-echo "==> NDI Manager build (macOS 13+ / Apple Silicon)"
+echo "==> NDI Manager build (macOS 13+ / Intel x86_64)"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "Erreur: ce script doit etre lance sur macOS."
   exit 1
 fi
 
-if [[ "$(uname -m)" != "arm64" ]]; then
-  echo "Erreur: ce script cible uniquement Apple Silicon (arm64)."
+if [[ "$(uname -m)" != "x86_64" ]]; then
+  echo "Erreur: ce script cible uniquement Intel (x86_64)."
   exit 1
 fi
 
@@ -36,7 +36,7 @@ echo "==> Nettoyage build precedent"
 rm -rf build dist
 
 echo "==> Verification syntaxe"
-python3 -m py_compile main.py setup.py
+PYTHONPYCACHEPREFIX="$PWD/.pycache" PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile main.py setup.py
 
 echo "==> Generation .app"
 python3 setup.py py2app
@@ -49,3 +49,4 @@ fi
 
 echo "==> OK: application generee"
 echo "    $ROOT_DIR/$APP_PATH"
+

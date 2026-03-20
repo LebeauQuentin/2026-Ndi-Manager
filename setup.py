@@ -6,9 +6,8 @@ APP = ["main.py"]
 DATA_FILES = []
 OPTIONS = {
     "argv_emulation": True,
-    "arch": "arm64",
     # Icône de l'app.
-    "iconfile": "Media/ndi-manager.icns",
+    "iconfile": "media/ndi-manager.icns",
     "plist": {
         "CFBundleName": "NDI Manager",
         "CFBundleDisplayName": "NDI Manager",
@@ -22,8 +21,11 @@ OPTIONS = {
 if platform.system().lower() != "darwin":
     raise RuntimeError("Ce packaging est supporte uniquement sur macOS.")
 
-if platform.machine().lower() != "arm64":
-    raise RuntimeError("Ce packaging cible uniquement Apple Silicon (arm64).")
+machine = platform.machine().lower()
+if machine not in {"arm64", "x86_64"}:
+    raise RuntimeError(
+        "Ce packaging cible uniquement Apple Silicon (arm64) ou Intel (x86_64)."
+    )
 
 mac_ver, _, _ = platform.mac_ver()
 try:
@@ -33,6 +35,8 @@ except ValueError:
 
 if mac_major < 13:
     raise RuntimeError("Ce packaging requiert macOS 13+.")
+
+OPTIONS["arch"] = machine
 
 setup(
     app=APP,
