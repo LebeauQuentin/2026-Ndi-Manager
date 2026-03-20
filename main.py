@@ -26,6 +26,7 @@ from Cocoa import (
     NSApplicationActivationPolicyRegular,
     NSButton,
     NSEventModifierFlagCommand,
+    NSFont,
     NSImage,
     NSImageView,
     NSMakeRect,
@@ -41,6 +42,7 @@ from Cocoa import (
     NSTableColumn,
     NSTableView,
     NSTextField,
+    NSTextAlignmentCenter,
     NSTimer,
     NSWindow,
     NSWorkspace,
@@ -467,6 +469,7 @@ def check_network_for_ndi_1080p(duration_seconds: float = 3.0):
 
 def check_network_report(duration_seconds: float, profile: str, iface: str | None):
     thresholds = {
+        "NDI 720p": 120.0,
         "NDI 1080p": 200.0,
         "NDI 1080p (safe)": 250.0,
         "NDI 4K": 500.0,
@@ -501,21 +504,29 @@ def check_network_report(duration_seconds: float, profile: str, iface: str | Non
     mbps_measured = mbps_iface if mbps_iface is not None else mbps_total
     ok = mbps_measured >= required_mbps
 
+    mode_txt = "Total machine (tous les interfaces)" if not iface else f"Interface: {iface}"
+
     lines = []
-    lines.append(f"Profil: {profile} (seuil: {required_mbps:.0f} Mbps)")
-    if iface:
-        lines.append(f"Interface: {iface}")
+    lines.append(f"Profil: {profile} (seuil recommandé: {required_mbps:.0f} Mbps)")
+    lines.append(f"Mode: {mode_txt}")
+    lines.append(f"Fenêtre de mesure: {duration_seconds:.0f}s (trafic actuel)")
     if link_mbps is not None:
-        lines.append(f"Link speed déclaré: {link_mbps:.0f} Mbps" + ("" if isup is None else f" — {'UP' if isup else 'DOWN'}"))
-    lines.append(f"Débit observé (trafic actuel) sur {duration_seconds:.0f}s: {mbps_measured:.1f} Mbps")
+        lines.append(
+            f"Link speed déclaré: {link_mbps:.0f} Mbps"
+            + ("" if isup is None else f" — {'UP' if isup else 'DOWN'}")
+        )
+    lines.append(f"Débit observé: {mbps_measured:.1f} Mbps")
     if mbps_iface is not None:
         lines.append(f"(Total machine sur la même période: {mbps_total:.1f} Mbps)")
     lines.append("")
     if ok:
-        lines.append("Résultat: OK (marge a priori suffisante).")
+        lines.append("Résultat: OK (marge a priori suffisante pendant cette fenêtre).")
     else:
-        lines.append("Résultat: KO (risque de saccades / drops).")
-        lines.append("Note: ce test mesure le trafic actuel, pas la capacité max. Si le réseau est au repos, la valeur peut être basse.")
+        lines.append("Résultat: KO (risque de saccades / drops pendant cette fenêtre).")
+        lines.append(
+            "Note: ce test mesure le trafic actuel (pas la capacité max). "
+            "S'il n'y a presque aucun trafic sur la période, la mesure peut être basse."
+        )
 
     return ok, "\n".join(lines)
 
@@ -588,11 +599,10 @@ class TableDataSource(NSObject):
 
     def tableView_objectValueForTableColumn_row_(self, tableView, column, row):
         try:
+            key = column.identifier()
+            key_s = str(key) if key is not None else ""
             if row < 0 or row >= len(self.filtered):
                 return ""
-            key = column.identifier()
-            # Assure-toi que la clé est une chaîne Python (PyObjC peut renvoyer un objet ObjC).
-            key_s = str(key) if key is not None else ""
             v = self.filtered[row].get(key_s, "")
             return v if v is not None else ""
         except Exception:
@@ -637,6 +647,22 @@ class PreviewController(NSObject):
         self.timer = None
         self.window = None
         self.image_view = None
+        self._initial_image = None
+        return self
+
+    def initWithNDI_source_receiver_image_(
+        self, ndi: NDIWrapper, source: dict, recv, image
+    ):
+        self = objc.super(PreviewController, self).init()
+        if self is None:
+            return None
+        self.ndi = ndi
+        self.source = source
+        self.recv = recv
+        self.timer = None
+        self.window = None
+        self.image_view = None
+        self._initial_image = image
         return self
 
     def show(self):
@@ -649,11 +675,21 @@ class PreviewController(NSObject):
         self.image_view = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
         self.image_view.setImageScaling_(3)  # NSImageScaleProportionallyUpOrDown
         self.window.contentView().addSubview_(self.image_view)
+
+        # Afficher immédiatement la première image si on en a une.
+        if self._initial_image is not None:
+            try:
+                self.image_view.setImage_(self._initial_image)
+            except Exception:
+                pass
+
         self.window.makeKeyAndOrderFront_(None)
 
-        self.recv = self.ndi.create_receiver(self.source)
+        if self.recv is None:
+            self.recv = self.ndi.create_receiver(self.source)
+
         self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            1.0 / 30.0, self, "tick:", None, True
+            1.0 / 15.0, self, "tick:", None, True
         )
 
     def close(self):
@@ -670,7 +706,8 @@ class PreviewController(NSObject):
     def tick_(self, timer):
         if not self.recv:
             return
-        frame, frame_type = self.ndi.capture_video_frame(self.recv, timeout_ms=0)
+        # Évite un spin trop agressif: timeout non nul + intervalle plus bas.
+        frame, frame_type = self.ndi.capture_video_frame(self.recv, timeout_ms=50)
         if frame is None:
             return
         try:
@@ -687,7 +724,7 @@ class AppDelegate(NSObject):
         self._did_warn_ndi_unavailable = False
 
         screen_frame = NSApp().mainWindow().screen().frame() if NSApp().mainWindow() else None
-        # Fenêtre plus large pour que tous les contrôles tiennent correctement
+        # Fenêtre principale.
         width, height = 960, 480
         x = 100
         y = 100
@@ -762,8 +799,11 @@ class AppDelegate(NSObject):
         scroll_view.setHasVerticalScroller_(True)
 
         # Mini preview à droite
+        # (zone reservée au bloc "Check Network" pour une meilleure séparation visuelle)
+        preview_offset_y = 140
+        preview_height = max(1, table_height - preview_offset_y)
         self.preview_image = NSImageView.alloc().initWithFrame_(
-            NSMakeRect(table_width, table_bottom, 220, table_height)
+            NSMakeRect(table_width, table_bottom + preview_offset_y, 220, preview_height)
         )
         self.preview_image.setImageScaling_(3)  # proportionnel
 
@@ -795,15 +835,35 @@ class AppDelegate(NSObject):
         self.status_label.setDrawsBackground_(False)
         self.status_label.setStringValue_("Prêt. EasyIP SetupTool Plus est uniquement disponible sous Windows (PC ou VM).")
 
-        # Bloc "Network test" au-dessus de la ligne de boutons bas
-        self.check_button = NSButton.alloc().initWithFrame_(NSMakeRect(20, 45, 130, 24))
+        # Bloc "Network test" clair à droite du tableau
+        right_panel_x = table_width
+        right_panel_w = width - table_width
+        network_x = right_panel_x + 10
+        network_w = right_panel_w - 20
+
+        self.network_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(network_x, 180, network_w, 20)
+        )
+        self.network_label.setEditable_(False)
+        # Style discret : header de section, pas une "box" visuelle épaisse.
+        self.network_label.setBordered_(False)
+        self.network_label.setDrawsBackground_(False)
+        self.network_label.setBezeled_(False)
+        self.network_label.setFont_(NSFont.boldSystemFontOfSize_(14.0))
+        self.network_label.setAlignment_(NSTextAlignmentCenter)
+        self.network_label.setStringValue_("Network test")
+
+        self.check_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(network_x, 88, network_w, 24)
+        )
         self.check_button.setTitle_("Check Network")
         self.check_button.setTarget_(self)
         self.check_button.setAction_("checkNetwork:")
 
-        # Déplace les pickers juste à droite du bouton Check Network
-        self.iface_picker.setFrame_(NSMakeRect(160, 45, 180, 24))
-        self.profile_picker.setFrame_(NSMakeRect(350, 45, 180, 24))
+        # Pickers dans la zone Network test (empile verticalement)
+        # AppKit: coordonnee Y depuis le bas -> label en premier (plus haut), puis selects, puis bouton.
+        self.iface_picker.setFrame_(NSMakeRect(network_x, 150, network_w, 22))
+        self.profile_picker.setFrame_(NSMakeRect(network_x, 120, network_w, 22))
 
         # Ligne de boutons bas (centrée sur les actions courantes)
         self.refresh_button = NSButton.alloc().initWithFrame_(NSMakeRect(20, 15, 130, 26))
@@ -851,6 +911,7 @@ class AppDelegate(NSObject):
         content_view.addSubview_(self.iface_picker)
         content_view.addSubview_(self.profile_picker)
         content_view.addSubview_(self.status_label)
+        content_view.addSubview_(self.network_label)
         content_view.addSubview_(scroll_view)
         content_view.addSubview_(self.preview_image)
         content_view.addSubview_(self.check_button)
@@ -919,10 +980,22 @@ class AppDelegate(NSObject):
             self.status_label.setStringValue_("Erreur pendant le scan NDI.")
 
     def checkNetwork_(self, sender):
-        self.status_label.setStringValue_("Mesure du réseau…")
-        iface = self.iface_picker.titleOfSelectedItem()
+        self.status_label.setStringValue_("Mesure du réseau (3s)…")
+        mode = self.iface_picker.titleOfSelectedItem()
         profile = self.profile_picker.titleOfSelectedItem()
-        ok, report = check_network_report(3.0, profile, iface if iface and not iface.startswith("(") else None)
+
+        iface_arg: str | None = None
+        if not mode:
+            iface_arg = None
+        elif mode.startswith("(Total"):
+            iface_arg = None
+        elif mode.startswith("(Auto"):
+            iface_arg = self._pick_auto_interface()
+        else:
+            # Interface nommée
+            iface_arg = mode
+
+        ok, report = check_network_report(3.0, profile, iface_arg)
         self._show_alert("Check Network", report)
         self.status_label.setStringValue_("Check Network terminé." + (" OK" if ok else " KO"))
 
@@ -935,8 +1008,6 @@ class AppDelegate(NSObject):
         return self.data_source.rowAt_(idx)
 
     def previewSelected_(self, sender):
-        # Mini-preview SAFE : on capture une seule image de la source sélectionnée,
-        # sans boucle temps réel ni timer, pour limiter les risques côté libndi.dylib.
         if not self.ndi:
             self._show_alert("Preview", "NDI n'est pas initialisé.")
             return
@@ -946,97 +1017,66 @@ class AppDelegate(NSObject):
             self._show_alert("Preview", "Sélectionne une source NDI d'abord.")
             return
 
-        # Variantes de connexion : NDI peut accepter une source via p_url_address ou p_ip_address.
-        # On essaye donc plusieurs modes pour isoler le champ attendu.
-        ip_only = _extract_ip_from_url(row.get("url", "") or "") or row.get("ip", "")
+        # Pré-test de stabilité : on n'ouvre la boucle temps réel que si on reçoit
+        # effectivement au moins une frame vidéo. (Certaines sources peuvent sinon
+        # provoquer des crashs dans la boucle NSTimer.)
+        recv = None
+        first_img = None
+        got_video_frame = False
+        try:
+            if self.preview_controller is not None:
+                try:
+                    self.preview_controller.close()
+                except Exception:
+                    pass
 
-        variants = [
-            ("mode:url->p_url_address", row),
-            (
-                "mode:ipOnly->p_ip_address",
-                {"name": row.get("name", ""), "url": "", "ip_raw": ip_only, "ip": row.get("ip", "")},
-            ),
-            (
-                "mode:nameOnly",
-                {"name": row.get("name", ""), "url": "", "ip_raw": "", "ip": ""},
-            ),
-        ]
+            recv = self.ndi.create_receiver(row, recv_name="NDI Manager PreviewWarmup")
 
-        overall_last_frame_type = None
-        mode_last_frame_types: list[tuple[str, int | None]] = []
-        mode_type_sequences: list[tuple[str, str]] = []
-        for mode_name, variant in variants:
-            recv = None
-            frame = None
-            try:
-                recv = self.ndi.create_receiver(variant, recv_name="NDI Manager MiniPreview")
-                # Petit délai pour laisser le receiver s'établir
-                time.sleep(0.5)
-
-                # On tente plus longtemps pour les sources lentes à démarrer.
-                total_attempts = 25
-                timeout_ms = 1000
-
-                local_last_frame_type = None
-                local_types: list[int] = []
-                for _ in range(total_attempts):
-                    frame, frame_type = self.ndi.capture_video_frame(recv, timeout_ms=timeout_ms)
-                    overall_last_frame_type = frame_type
-                    local_last_frame_type = frame_type
-                    local_types.append(int(frame_type))
-                    if frame is None:
-                        continue
-                    img = _ndi_frame_to_nsimage(frame)
-                    self.ndi.free_video_frame(recv, frame)
-                    frame = None
-                    if img is not None:
-                        self.preview_image.setImage_(img)
-                        self.status_label.setStringValue_(f"Mini-preview mis à jour ({mode_name}) pour: {row.get('name','')}")
-                        return
-                # conversion échouée ou aucun frame
-            except Exception:
-                # On laisse tomber ce mode, on essaie le suivant.
-                pass
-            finally:
-                if recv is not None:
-                    # Enregistre le résultat du mode même si on n'a pas de frame vidéo.
-                    # (S'il y a eu une exception, local_last_frame_type peut être non défini,
-                    # dans ce cas on laisse None.)
-                    try:
-                        mode_last_frame_types.append((mode_name, local_last_frame_type))
-                        seq = ",".join(str(t) for t in local_types[:12])
-                        if len(local_types) > 12:
-                            seq += ",..."
-                        mode_type_sequences.append((mode_name, seq))
-                    except Exception:
-                        mode_last_frame_types.append((mode_name, None))
-                        mode_type_sequences.append((mode_name, "n/a"))
-                if frame is not None and recv is not None:
+            # Warmup: on attend une frame vidéo réelle (frame_type == 1).
+            for _ in range(10):
+                frame, frame_type = self.ndi.capture_video_frame(recv, timeout_ms=400)
+                if frame is None:
+                    continue
+                # frame est non-None => frame_type devrait être 1 dans notre wrapper
+                got_video_frame = True
+                try:
+                    first_img = _ndi_frame_to_nsimage(frame)
+                except Exception:
+                    first_img = None
+                finally:
                     try:
                         self.ndi.free_video_frame(recv, frame)
                     except Exception:
                         pass
-                if recv is not None:
-                    try:
-                        self.ndi.destroy_receiver(recv)
-                    except Exception:
-                        pass
+                break
 
-        # Si aucun mode ne donne une frame vidéo convertible :
-        target_url = row.get("url", "")
-        target_ip_raw = row.get("ip_raw", "")
-        target_ip_display = row.get("ip", "")
-        self._show_alert(
-            "Preview",
-            "Aucune image NDI n'a pu être capturée (timeout / flux non reçu).\n"
-            f"- last frame_type: {overall_last_frame_type}\n"
-            f"- per-mode: {', '.join([f'{m}:{t}' for (m,t) in mode_last_frame_types])}\n"
-            f"- per-mode sequence: {' | '.join([f'{m}=[{s}]' for (m,s) in mode_type_sequences])}\n"
-            f"- target name: {row.get('name','')}\n"
-            f"- target url (p_url_address): {target_url}\n"
-            f"- target ip_raw (p_ip_address): {target_ip_raw}\n"
-            f"- target ip (display): {target_ip_display}",
-        )
+            if not got_video_frame:
+                self._show_alert(
+                    "Preview",
+                    "Aucune frame vidéo n'a été reçue pour cette source.\n"
+                    "La fenêtre temps réel n'est pas ouverte pour éviter un crash.",
+                )
+                return
+
+            # Ouvrir la fenêtre temps réel avec le receiver déjà créé.
+            self.preview_controller = PreviewController.alloc().initWithNDI_source_receiver_image_(
+                self.ndi, row, recv, first_img
+            )
+            recv = None  # le contrôleur devient propriétaire
+            if self.preview_controller is None:
+                raise RuntimeError("PreviewController init a échoué.")
+            self.preview_controller.show()
+            self.status_label.setStringValue_(
+                f"Preview temps réel ouvert pour: {row.get('name','')}"
+            )
+        except Exception as e:
+            self._show_alert("Preview", f"Impossible d'ouvrir le preview temps réel.\n{e}")
+        finally:
+            if recv is not None:
+                try:
+                    self.ndi.destroy_receiver(recv)
+                except Exception:
+                    pass
 
     def copyIP_(self, sender):
         row = self._selected_row()
@@ -1143,12 +1183,34 @@ class AppDelegate(NSObject):
 
     def _populate_interfaces(self):
         self.iface_picker.removeAllItems()
+        self.iface_picker.addItemWithTitle_("(Auto interface)")
+        self.iface_picker.addItemWithTitle_("(Total machine)")
+
         ifaces = sorted(psutil.net_if_stats().keys())
         if not ifaces:
             self.iface_picker.addItemWithTitle_("(no interfaces)")
             return
+
         for i in ifaces:
             self.iface_picker.addItemWithTitle_(i)
+
+    def _pick_auto_interface(self) -> str | None:
+        stats = psutil.net_if_stats()
+        if not stats:
+            return None
+        # Priorité: en0 si UP, sinon première interface UP non-loopback.
+        st = stats.get("en0")
+        if st and st.isup:
+            return "en0"
+
+        # Essayons dans un ordre déterministe
+        for name in sorted(stats.keys()):
+            if name.startswith("lo") or name.startswith("Loopback"):
+                continue
+            s = stats.get(name)
+            if s and s.isup:
+                return name
+        return None
 
     def openNDITools_(self, sender=None):
         # Tentative d'ouverture d'une app NDI Tools si présente, sinon page de download
